@@ -16,12 +16,15 @@ from concurrent.futures import ThreadPoolExecutor
 from .calibration import CalibrationSession
 from .contracts import (Contract, ExerciseStyle, MarketParams, Model,
                         PricingResult)
-from .errors import ContractExpiredError, ModelNotApplicableError, ValidationError
-from .pricing import asian, black_scholes
+from .errors import (CapacityExceededError, ContractExpiredError,
+                     ModelNotApplicableError, ValidationError)
+from .pricing import asian, barrier, black_scholes
+from .sessions import SessionSnapshot
 
 _VOL_MIN, _VOL_MAX = 1e-4, 5.0
 _RATE_MIN, _RATE_MAX = -0.20, 0.50
 _BATCH_WORKERS = 4  # 批量并发度有界
+_MAX_BATCH = 64     # 批量规模上限，到顶按 capacity_exceeded 拒绝
 
 
 def _require_finite(name: str, value: float) -> None:
@@ -47,6 +50,26 @@ def _validate_contract(contract: Contract) -> None:
                 "亚式期权平均点数量须在 [1, 366]",
                 detail={"parameter": "averaging_points",
                         "value": contract.averaging_points})
+    if contract.style is ExerciseStyle.BARRIER:
+        if contract.barrier is None or not math.isfinite(contract.barrier) \
+                or contract.barrier <= 0.0:
+            raise ValidationError(
+                "障碍合约必须给定正的有限障碍水平",
+                detail={"parameter": "barrier", "value": contract.barrier})
+        if contract.barrier_direction is None or contract.knock is None:
+            raise ValidationError(
+                "障碍合约必须给定障碍方向（up/down）与敲入敲出（in/out）",
+                detail={"barrier_direction": contract.barrier_direction,
+                        "knock": contract.knock})
+        if not math.isfinite(contract.rebate) or contract.rebate < 0.0:
+            raise ValidationError(
+                "回扣必须为非负有限值",
+                detail={"parameter": "rebate", "value": contract.rebate})
+    elif (contract.barrier is not None or contract.barrier_direction
+          is not None or contract.knock is not None or contract.rebate != 0.0):
+        raise ValidationError(
+            "非障碍合约不允许携带障碍参数",
+            detail={"style": contract.style.value})
 
 
 def _validate_market(market: MarketParams) -> None:
@@ -68,9 +91,23 @@ def _validate_market(market: MarketParams) -> None:
 
 
 def _resolve_model(contract: Contract, model: Model | None) -> Model:
+    """模型适用范围双向守住：不匹配的组合在出数之前明确拒绝。"""
     if model is None:
-        return (Model.BLACK_SCHOLES if contract.style is ExerciseStyle.EUROPEAN
-                else Model.MONTE_CARLO)
+        if contract.style is ExerciseStyle.EUROPEAN:
+            return Model.BLACK_SCHOLES
+        if contract.style is ExerciseStyle.BARRIER:
+            return Model.BARRIER_ANALYTIC
+        return Model.MONTE_CARLO
+    if contract.style is ExerciseStyle.BARRIER:
+        if model is not Model.BARRIER_ANALYTIC:
+            raise ModelNotApplicableError(
+                "单障碍合约只接受 barrier_analytic 解析模型",
+                detail={"style": contract.style.value, "model": model.value})
+        return model
+    if model is Model.BARRIER_ANALYTIC:
+        raise ModelNotApplicableError(
+            "barrier_analytic 仅适用于单障碍合约",
+            detail={"style": contract.style.value, "model": model.value})
     if (contract.style is ExerciseStyle.ASIAN_ARITHMETIC
             and model is Model.BLACK_SCHOLES):
         raise ModelNotApplicableError(
@@ -92,7 +129,7 @@ class PricingService:
 
     def price(self, contract: Contract, market: MarketParams,
               model: Model | None = None) -> PricingResult:
-        return self._price_one(contract, market, model)
+        return self._price_one(contract, market, model, self._session)
 
     def price_batch(self, items: list[tuple[Contract, MarketParams]],
                     model: Model | None = None) -> list[PricingResult]:
@@ -100,20 +137,57 @@ class PricingService:
 
         相同 (contract, market) 的校准由会话缓存/single-flight 自动复用。
         """
+        self._check_batch_size(len(items))
         if not items:
             return []
         with ThreadPoolExecutor(max_workers=_BATCH_WORKERS) as pool:
-            futures = [pool.submit(self._price_one, c, m, model)
+            futures = [pool.submit(self._price_one, c, m, model,
+                                   self._session)
                        for c, m in items]
             return [f.result() for f in futures]
 
+    # ---- 会话路径：校准只认该会话快照内的报价，结果带会话标识 -------------
+
+    def price_in_session(self, snapshot: SessionSnapshot, contract: Contract,
+                         model: Model | None = None) -> PricingResult:
+        return self._price_one(contract, snapshot.market, model,
+                               snapshot.calibration,
+                               session_id=snapshot.session_id,
+                               session_version=snapshot.version)
+
+    def price_batch_in_session(
+            self, snapshot: SessionSnapshot, contracts: list[Contract],
+            model: Model | None = None) -> list[PricingResult]:
+        """会话内批量：同一快照的校准缓存被整批复用，不重复校准。"""
+        self._check_batch_size(len(contracts))
+        if not contracts:
+            return []
+        with ThreadPoolExecutor(max_workers=_BATCH_WORKERS) as pool:
+            futures = [
+                pool.submit(self._price_one, c, snapshot.market, model,
+                            snapshot.calibration,
+                            session_id=snapshot.session_id,
+                            session_version=snapshot.version)
+                for c in contracts]
+            return [f.result() for f in futures]
+
+    @staticmethod
+    def _check_batch_size(n: int) -> None:
+        if n > _MAX_BATCH:
+            raise CapacityExceededError(
+                "批量规模超过上限",
+                detail={"resource": "batch_size",
+                        "limit": _MAX_BATCH, "actual": n})
+
     def _price_one(self, contract: Contract, market: MarketParams,
-                   model: Model | None) -> PricingResult:
+                   model: Model | None, session: CalibrationSession,
+                   session_id: str | None = None,
+                   session_version: int | None = None) -> PricingResult:
         _validate_contract(contract)
         _validate_market(market)
         resolved = _resolve_model(contract, model)
 
-        vol = self._session.calibrated_volatility(contract, market)
+        vol = session.calibrated_volatility(contract, market)
 
         if resolved is Model.BLACK_SCHOLES:
             price = black_scholes.bs_price(
@@ -123,21 +197,43 @@ class PricingService:
                 contract.option_type, market.spot, contract.strike,
                 contract.maturity_years, market.risk_free_rate, vol)
             diagnostics: dict = {"solver": "closed_form"}
+        elif resolved is Model.BARRIER_ANALYTIC:
+            price = barrier.barrier_price(
+                contract.option_type, contract.barrier_direction,
+                contract.knock, market.spot, contract.strike,
+                contract.barrier, contract.maturity_years,
+                market.risk_free_rate, vol, contract.rebate)
+            greeks = barrier.barrier_greeks(
+                contract.option_type, contract.barrier_direction,
+                contract.knock, market.spot, contract.strike,
+                contract.barrier, contract.maturity_years,
+                market.risk_free_rate, vol, contract.rebate)
+            diagnostics = {"solver": "reiner_rubinstein"}
         else:
             seed = _derive_seed(contract, market, vol)
-            price, std_err = asian.asian_price(
-                contract.option_type, market.spot, contract.strike,
-                contract.maturity_years, market.risk_free_rate, vol,
-                contract.averaging_points, seed=seed)
+            if contract.style is ExerciseStyle.EUROPEAN:
+                price, std_err = asian.european_mc_price(
+                    contract.option_type, market.spot, contract.strike,
+                    contract.maturity_years, market.risk_free_rate, vol,
+                    seed=seed)
+                greeks_fn = asian.european_mc_greeks
+                greeks_args: tuple = ()
+            else:
+                price, std_err = asian.asian_price(
+                    contract.option_type, market.spot, contract.strike,
+                    contract.maturity_years, market.risk_free_rate, vol,
+                    contract.averaging_points, seed=seed)
+                greeks_fn = asian.asian_greeks
+                greeks_args = (contract.averaging_points,)
             if std_err > 0.02 * max(price, 1e-12):
                 from .errors import NumericalInstabilityError
                 raise NumericalInstabilityError(
                     "蒙特卡洛标准误超过价格 2%，结果不可靠",
                     detail={"price": price, "std_err": std_err})
-            greeks = asian.asian_greeks(
+            greeks = greeks_fn(
                 contract.option_type, market.spot, contract.strike,
                 contract.maturity_years, market.risk_free_rate, vol,
-                contract.averaging_points, seed=seed)
+                *greeks_args, seed=seed)
             diagnostics = {"solver": "monte_carlo", "seed": seed,
                            "mc_std_err": std_err}
 
@@ -148,4 +244,6 @@ class PricingService:
             greeks=greeks,
             calibrated_volatility=vol,
             diagnostics=diagnostics,
+            session_id=session_id,
+            session_version=session_version,
         )

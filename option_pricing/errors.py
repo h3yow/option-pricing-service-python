@@ -37,6 +37,27 @@ class ModelNotApplicableError(PricingError):
     code = "model_not_applicable"
 
 
+# ---- 会话与容量 -------------------------------------------------------------
+
+
+class SessionNotFoundError(PricingError):
+    """引用的校准会话不存在（未创建或已删除）。"""
+
+    code = "session_not_found"
+
+
+class QuoteNotFoundError(PricingError):
+    """会话内没有该合约的报价，无法据此校准。"""
+
+    code = "quote_not_found"
+
+
+class CapacityExceededError(PricingError):
+    """容量到顶（会话数 / 批量规模 / 缓存条目），按可区分原因拒绝。"""
+
+    code = "capacity_exceeded"
+
+
 # ---- 数值求解 -------------------------------------------------------------
 
 class CalibrationError(PricingError):

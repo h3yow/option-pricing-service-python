@@ -11,13 +11,17 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from option_pricing.calibration import CalibrationSession
-from option_pricing.contracts import (Contract, ExerciseStyle, Greeks,
+from option_pricing.contracts import (BarrierDirection, Contract,
+                                      ExerciseStyle, Greeks, KnockType,
                                       MarketParams, Model, OptionType,
                                       PricingResult)
-from option_pricing.errors import (CalibrationError, ContractExpiredError,
+from option_pricing.errors import (CalibrationError, CapacityExceededError,
+                                   ContractExpiredError,
                                    ModelNotApplicableError, PricingError,
+                                   QuoteNotFoundError, SessionNotFoundError,
                                    ValidationError)
 from option_pricing.service import PricingService
+from option_pricing.sessions import SessionManager
 
 # ---------------------------------------------------------------- 内置状态
 
@@ -34,6 +38,17 @@ _CONTRACTS: dict[str, Contract] = {
                                averaging_points=12),
     "EXPIRED-CALL": Contract("EXPIRED-CALL", OptionType.CALL,
                              ExerciseStyle.EUROPEAN, 100.0, 0.0),
+    # 单障碍合约样例
+    "UO-CALL-120": Contract("UO-CALL-120", OptionType.CALL,
+                            ExerciseStyle.BARRIER, 100.0, 1.0,
+                            barrier=120.0,
+                            barrier_direction=BarrierDirection.UP,
+                            knock=KnockType.OUT, rebate=2.0),
+    "DI-PUT-90": Contract("DI-PUT-90", OptionType.PUT,
+                          ExerciseStyle.BARRIER, 100.0, 1.0,
+                          barrier=90.0,
+                          barrier_direction=BarrierDirection.DOWN,
+                          knock=KnockType.IN, rebate=1.0),
 }
 
 # 内置目标市价：校准会话据此反解隐含波动率。行情更新时会话整体重建，
@@ -46,6 +61,7 @@ def _build_service(market: MarketParams) -> PricingService:
 
 
 _service = _build_service(_market)
+_sessions = SessionManager()
 
 app = FastAPI(title="option-pricing-service")
 
@@ -60,6 +76,9 @@ _STATUS = {
     "no_convergence": 422,
     "no_solution": 422,
     "numerical_instability": 422,
+    SessionNotFoundError.code: 404,
+    QuoteNotFoundError.code: 422,
+    CapacityExceededError.code: 429,
 }
 
 
@@ -100,6 +119,24 @@ class MarketUpdate(BaseModel):
     risk_free_rate: float | None = None
 
 
+class SessionCreate(BaseModel):
+    market: MarketParams
+    quotes: dict[str, float] = Field(min_length=1)  # contract_id -> 目标价
+    session_id: str | None = None
+
+
+class SessionUpdate(BaseModel):
+    market: MarketParams | None = None
+    quotes: dict[str, float] | None = Field(default=None, min_length=1)
+
+
+class SessionOut(BaseModel):
+    session_id: str
+    version: int
+    market: MarketParams
+    quotes: dict[str, float]
+
+
 class GreeksOut(BaseModel):
     delta: float
     gamma: float
@@ -115,13 +152,17 @@ class PriceOut(BaseModel):
     greeks: GreeksOut
     calibrated_volatility: float
     diagnostics: dict
+    session_id: str | None = None
+    session_version: int | None = None
 
 
 def _to_out(r: PricingResult) -> PriceOut:
     return PriceOut(contract_id=r.contract_id, model=r.model, price=r.price,
                     greeks=GreeksOut(**r.greeks.__dict__),
                     calibrated_volatility=r.calibrated_volatility,
-                    diagnostics=r.diagnostics)
+                    diagnostics=r.diagnostics,
+                    session_id=r.session_id,
+                    session_version=r.session_version)
 
 
 def _get_contract(contract_id: str) -> Contract:
@@ -189,4 +230,59 @@ def price_batch(req: BatchRequest) -> list[PriceOut]:
                                               "message": "批量请求暂不支持混合模型",
                                               "detail": {}}})
     results = service.price_batch(contracts, models[0])
+    return [_to_out(r) for r in results]
+
+
+# ---------------------------------------------------------------- 会话路由
+
+def _session_out(snap) -> SessionOut:
+    return SessionOut(session_id=snap.session_id, version=snap.version,
+                      market=snap.market, quotes=dict(snap.quotes))
+
+
+@app.post("/sessions", response_model=SessionOut, status_code=201)
+def create_session(req: SessionCreate) -> SessionOut:
+    return _session_out(_sessions.create(req.market, dict(req.quotes),
+                                         req.session_id))
+
+
+@app.get("/sessions/{session_id}", response_model=SessionOut)
+def get_session(session_id: str) -> SessionOut:
+    return _session_out(_sessions.get(session_id))
+
+
+@app.put("/sessions/{session_id}", response_model=SessionOut)
+def update_session(session_id: str, req: SessionUpdate) -> SessionOut:
+    """更新行情/报价：版本 +1 并整体重建校准缓存，后续请求必然重新校准。"""
+    return _session_out(_sessions.update(session_id, market=req.market,
+                                         quotes=(dict(req.quotes)
+                                                 if req.quotes is not None
+                                                 else None)))
+
+
+@app.delete("/sessions/{session_id}", status_code=204)
+def delete_session(session_id: str) -> None:
+    _sessions.delete(session_id)
+
+
+@app.post("/sessions/{session_id}/price", response_model=PriceOut)
+def price_in_session(session_id: str, req: PriceRequest) -> PriceOut:
+    contract = _get_contract(req.contract_id)
+    snap = _sessions.get(session_id)  # 原子快照：要么全旧要么全新
+    return _to_out(_service.price_in_session(snap, contract, req.model))
+
+
+@app.post("/sessions/{session_id}/price/batch", response_model=list[PriceOut])
+def price_batch_in_session(session_id: str,
+                           req: BatchRequest) -> list[PriceOut]:
+    items = [(_get_contract(i.contract_id), i.model) for i in req.items]
+    models = [m for _, m in items]
+    if len(set(models)) > 1:
+        raise HTTPException(status_code=400,
+                            detail={"error": {"code": "mixed_models",
+                                              "message": "批量请求暂不支持混合模型",
+                                              "detail": {}}})
+    snap = _sessions.get(session_id)
+    results = _service.price_batch_in_session(
+        snap, [c for c, _ in items], models[0])
     return [_to_out(r) for r in results]

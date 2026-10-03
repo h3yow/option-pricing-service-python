@@ -20,9 +20,10 @@ _N_PATHS = 40_000  # 实际路径数（含对偶变量则为 2 倍）
 
 def _simulate_payoffs(option_type: OptionType, spot: float, strike: float,
                       maturity: float, rate: float, vol: float,
-                      averaging_points: int, seed: int) -> np.ndarray:
+                      averaging_points: int | None, seed: int) -> np.ndarray:
+    """averaging_points 为 None 时只看终端价格（欧式），否则算术平均。"""
     rng = np.random.default_rng(seed)
-    n_steps = max(averaging_points, 1)
+    n_steps = max(averaging_points or 1, 1)
     dt = maturity / n_steps
     # 对偶变量：一半路径用 z，另一半用 -z
     half = _N_PATHS // 2
@@ -34,7 +35,7 @@ def _simulate_payoffs(option_type: OptionType, spot: float, strike: float,
     diff = vol * math.sqrt(dt)
     log_paths = log_s0 + np.cumsum(drift + diff * z, axis=1)
     paths = np.exp(log_paths)
-    avg = paths.mean(axis=1)
+    avg = paths[:, -1] if averaging_points is None else paths.mean(axis=1)
 
     if option_type is OptionType.CALL:
         payoff = np.maximum(avg - strike, 0.0)
@@ -62,9 +63,24 @@ def asian_price(option_type: OptionType, spot: float, strike: float,
     return price, std_err
 
 
-def asian_greeks(option_type: OptionType, spot: float, strike: float,
-                 maturity: float, rate: float, vol: float,
-                 averaging_points: int, *, seed: int) -> Greeks:
+def european_mc_price(option_type: OptionType, spot: float, strike: float,
+                      maturity: float, rate: float, vol: float, *,
+                      seed: int) -> tuple[float, float]:
+    """欧式合约的蒙特卡洛价格（终端支付）。
+
+    欧式走 MC 时必须用终端价格，绝不能复用亚式的平均支付而返回一个
+    含义是别的产品的数值。
+    """
+    payoffs = _simulate_payoffs(option_type, spot, strike, maturity,
+                                rate, vol, None, seed)
+    price = _check(float(payoffs.mean()), "price")
+    std_err = _check(float(payoffs.std(ddof=1) / math.sqrt(payoffs.size)),
+                     "std_err")
+    return price, std_err
+
+
+def _mc_greeks(price_fn, spot: float, maturity: float, rate: float,
+               vol: float) -> Greeks:
     """中心有限差分 + 共同随机数。theta 按日、vega/rho 按 1% 报告。"""
     h_s = max(spot * 1e-4, 1e-6)
     h_v = 1e-4
@@ -72,8 +88,7 @@ def asian_greeks(option_type: OptionType, spot: float, strike: float,
     h_t = min(1.0 / 365.0, maturity / 2.0)
 
     def p(s: float, v: float, r: float, t: float) -> float:
-        price, _ = asian_price(option_type, s, strike, t, r, v,
-                               averaging_points, seed=seed)
+        price, _ = price_fn(s, t, r, v)
         return price
 
     p0 = p(spot, vol, rate, maturity)
@@ -93,3 +108,24 @@ def asian_greeks(option_type: OptionType, spot: float, strike: float,
         theta=_check((p_td - p_tu) / (2.0 * h_t) / 365.0, "theta"),
         rho=_check((p_ru - p_rd) / (2.0 * h_r) / 100.0, "rho"),
     )
+
+
+def asian_greeks(option_type: OptionType, spot: float, strike: float,
+                 maturity: float, rate: float, vol: float,
+                 averaging_points: int, *, seed: int) -> Greeks:
+    """中心有限差分 + 共同随机数。theta 按日、vega/rho 按 1% 报告。"""
+    def price_fn(s: float, t: float, r: float, v: float):
+        return asian_price(option_type, s, strike, t, r, v,
+                           averaging_points, seed=seed)
+
+    return _mc_greeks(price_fn, spot, maturity, rate, vol)
+
+
+def european_mc_greeks(option_type: OptionType, spot: float, strike: float,
+                       maturity: float, rate: float, vol: float, *,
+                       seed: int) -> Greeks:
+    """欧式 MC 的希腊值（终端支付，口径与 asian_greeks 一致）。"""
+    def price_fn(s: float, t: float, r: float, v: float):
+        return european_mc_price(option_type, s, strike, t, r, v, seed=seed)
+
+    return _mc_greeks(price_fn, spot, maturity, rate, vol)
